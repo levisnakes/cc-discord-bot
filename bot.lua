@@ -20,7 +20,7 @@
 --
 -- Everything is written to bot.log (the run before is bot.log.old).
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 -- ======================== SETTINGS ===========================
 -- To keep changes over updates, put them in bot_settings.lua instead.
@@ -212,27 +212,48 @@ local function plain(s)
   return (s:gsub("[`*]", ""))
 end
 
--- Chat Box messages, one at a time: it refuses messages sent too quickly.
-local function chatSend(method, ...)
-  if not chatBox then return false end
+-- One Chat Box call, retried while it says "too often" (it refuses
+-- messages sent too quickly). Returns true, or false and why.
+local function chatCall(method, ...)
   for _ = 1, 8 do
     local ok, res, err = pcall(chatBox[method], ...)
     if ok and res then return true end
     local why = tostring(ok and err or res)
-    if not why:lower():find("too often") and not why:lower():find("cooldown") then
-      log("chat box %s failed: %s", method, why)
-      return false
-    end
+    if not why:lower():find("too often") and not why:lower():find("cooldown") then return false, why end
     sleep(0.5)
   end
-  log("chat box busy, message dropped")
-  return false
+  return false, "chat box busy"
+end
+
+-- Formatted messages, falling back step by step (fewer extras, then plain
+-- text) if this Chat Box version won't take them, so something always arrives.
+local mcText
+local function chatSend(method, json, a, b, c, d)
+  if not chatBox then return false end
+  local toPlayer = method == "sendFormattedMessageToPlayer"
+  local args = toPlayer and { json, a, b, c, d } or { json, a, b, c }
+  local ok, why = chatCall(method, table.unpack(args))
+  if ok then return true end
+  log("chat box %s failed: %s", method, why)
+  -- Just the message (and player).
+  ok, why = chatCall(method, json, toPlayer and a or nil)
+  if ok then return true end
+  log("  plain %s failed too: %s", method, why)
+  -- Plain text.
+  local text = ""
+  local parts = textutils.unserializeJSON(json)
+  for _, p in ipairs(type(parts) == "table" and parts or {}) do text = text .. tostring(p.text or "") end
+  text = text:gsub("\n", " - "):gsub("^ %- ", "")
+  if toPlayer then ok, why = chatCall("sendMessageToPlayer", text, a)
+  else ok, why = chatCall("sendMessage", text) end
+  if not ok then log("  sendMessage failed too: %s", why) end
+  return ok
 end
 
 local function hex(c) return string.format("#%06X", c or COLORS.blurple) end
 
 -- A card (title, description, fields, footer, content, color) as chat text.
-local function mcText(card)
+function mcText(card)
   local parts = {}
   if card.title then parts[#parts + 1] = { text = plain(card.title), color = hex(card.color), bold = true } end
   if card.description then
