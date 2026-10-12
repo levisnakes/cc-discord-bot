@@ -20,7 +20,7 @@
 --
 -- Everything is written to bot.log (the run before is bot.log.old).
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 -- ======================== SETTINGS ===========================
 -- To keep changes over updates, put them in bot_settings.lua instead.
@@ -243,6 +243,10 @@ local function mcText(card)
     parts[#parts + 1] = { text = plain(f.value), color = "white", bold = false }
   end
   if card.content then parts[#parts + 1] = { text = plain(card.content), color = "white" } end
+  if card.footer and card.footerInGame then
+    parts[#parts + 1] = { text = "
+" .. plain(card.footer), color = "gray", bold = false, italic = true }
+  end
   if #parts == 0 then parts[1] = { text = "" } end
   return textutils.serializeJSON(parts)
 end
@@ -381,8 +385,17 @@ COMMANDS.say = { usage = "say [Title |] text", desc = "post a formatted message"
   if rest == "" then ctx.reply({ content = "Usage: " .. PREFIX .. "say Title | your message" }) return end
   local title, text = rest:match("^(.-)%s*|%s*(.+)$")
   if not title then title, text = nil, rest end
-  ctx.announce({ title = title and title:sub(1, 256) or nil, description = text:sub(1, 4000), color = COLORS.blurple,
-    footer = "from " .. tostring(ctx.who):sub(1, 64) })
+  local card = { title = title and title:sub(1, 256) or nil, description = text:sub(1, 4000), color = COLORS.blurple,
+    footer = "from " .. tostring(ctx.who):sub(1, 64), footerInGame = true }
+  ctx.announce(card)
+  -- And the other side: Minecraft chat from Discord, the last-used Discord
+  -- channel from Minecraft.
+  if ctx.from == "discord" then
+    if chatBox then chatSend("sendFormattedMessage", mcText(card), botName(), "[]", "&9") end
+  elseif cfg.channel then
+    post("/channels/" .. cfg.channel .. "/messages", { embeds = { { title = card.title, description = card.description,
+      color = card.color, footer = { text = card.footer .. " (in Minecraft)" } } }, allowed_mentions = NO_PINGS })
+  end
   ctx.cleanup()
 end }
 
@@ -445,6 +458,11 @@ local function workLoop()
 end
 
 local function queueDiscord(m)
+  -- Remember where commands come from: Minecraft's !say posts there too.
+  if m.channel_id and m.guild_id and cfg.channel ~= m.channel_id then
+    cfg.channel = m.channel_id
+    saveConfig()
+  end
   queue[#queue + 1] = { ctx = discordCtx(m), text = m.content:sub(#PREFIX + 1) }
   os.queueEvent("bot_command")
 end

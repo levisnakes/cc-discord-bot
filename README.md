@@ -6,7 +6,7 @@ Run your Discord bot from a ComputerCraft computer. It answers commands typed in
 |---|---|
 | `!help` | lists the commands |
 | `!whoonline` | who's on the Minecraft server: from a Player Detector if there is one, otherwise via api.mcsrvstat.us (names if the server shares them, about once a minute) |
-| `!say Title \| text` | posts a formatted embed (the title is optional), and deletes your command message if the bot has Manage Messages |
+| `!say Title | text` | posts a formatted message in Discord **and** Minecraft chat (the title is optional; from Minecraft it goes to the Discord channel the bot was last used in)\| text` | posts a formatted embed (the title is optional), and deletes your command message if the bot has Manage Messages |
 | `!time` | the in-game day and time |
 | `!status [name]` | reports your other computers send in (see below) |
 | `!ping` | checks the bot is alive |
