@@ -5,11 +5,17 @@ Run your Discord bot from a ComputerCraft computer. It answers commands typed in
 | Command | Does |
 |---|---|
 | `!help` | lists the commands |
-| `!whoonline` | who's on the Minecraft server (player names if the server shares them), via api.mcsrvstat.us; updates about once a minute |
+| `!whoonline` | who's on the Minecraft server: from a Player Detector if there is one, otherwise via api.mcsrvstat.us (names if the server shares them, about once a minute) |
 | `!say Title \| text` | posts a formatted embed (the title is optional), and deletes your command message if the bot has Manage Messages |
 | `!time` | the in-game day and time |
 | `!status [name]` | reports your other computers send in (see below) |
 | `!ping` | checks the bot is alive |
+| `!mc text` | (from Discord) sends the text into Minecraft chat as `[Discord] you: text` - needs a Chat Box |
+
+## Advanced Peripherals
+
+- **Chat Box** on the bot's computer: the same commands work from **Minecraft chat**. Type `!whoonline`, or `$whoonline` to keep it out of chat (the Chat Box hides `$` messages). Answers go to just the player who asked; `!say` goes to everyone.
+- **Player Detector**: `!whoonline` lists the players straight from the server, instantly, no website needed (the server address is then only a fallback).
 
 ## Install
 

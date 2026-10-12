@@ -9,6 +9,10 @@
 --   !time        the in-game day and time
 --   !ping        checks the bot is alive
 --   !status      reports other computers send in over a modem (see README)
+--   !mc text     (Discord) sends the text into Minecraft chat
+-- With an Advanced Peripherals Chat Box the same commands work from
+-- Minecraft chat too (!cmd, or $cmd to keep it hidden), answered in chat;
+-- with a Player Detector, !whoonline lists players without any website.
 --
 -- First run asks for the bot token and the Minecraft server address and
 -- saves them in bot.cfg. The token is a password: anyone who can read this
@@ -16,7 +20,7 @@
 --
 -- Everything is written to bot.log (the run before is bot.log.old).
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 -- ======================== SETTINGS ===========================
 -- To keep changes over updates, put them in bot_settings.lua instead.
@@ -194,130 +198,271 @@ local function ago(t)
   return math.floor(s / 3600) .. "h ago"
 end
 
+-- ---------- Minecraft side (Advanced Peripherals) ----------
+
+local gateway = { state = "starting", user = nil, ping = nil }
+
+local chatBox = peripheral.find("chat_box") or peripheral.find("chatBox")
+local detector = peripheral.find("player_detector") or peripheral.find("playerDetector")
+
+-- Emoji placeholders don't belong in Minecraft chat, and neither does
+-- Discord markdown.
+local function plain(s)
+  s = tostring(s or ""):gsub("{%a+}%s*", "")
+  return (s:gsub("[`*]", ""))
+end
+
+-- Chat Box messages, one at a time: it refuses messages sent too quickly.
+local function chatSend(method, ...)
+  if not chatBox then return false end
+  for _ = 1, 8 do
+    local ok, res, err = pcall(chatBox[method], ...)
+    if ok and res then return true end
+    local why = tostring(ok and err or res)
+    if not why:lower():find("too often") and not why:lower():find("cooldown") then
+      log("chat box %s failed: %s", method, why)
+      return false
+    end
+    sleep(0.5)
+  end
+  log("chat box busy, message dropped")
+  return false
+end
+
+local function hex(c) return string.format("#%06X", c or COLORS.blurple) end
+
+-- A card (title, description, fields, footer, content, color) as chat text.
+local function mcText(card)
+  local parts = {}
+  if card.title then parts[#parts + 1] = { text = plain(card.title), color = hex(card.color), bold = true } end
+  if card.description then
+    parts[#parts + 1] = { text = (card.title and "\n" or "") .. plain(card.description), color = "white", bold = false }
+  end
+  for _, f in ipairs(card.fields or {}) do
+    parts[#parts + 1] = { text = "\n" .. plain(f.name) .. ": ", color = "gray", bold = false }
+    parts[#parts + 1] = { text = plain(f.value), color = "white", bold = false }
+  end
+  if card.content then parts[#parts + 1] = { text = plain(card.content), color = "white" } end
+  if #parts == 0 then parts[1] = { text = "" } end
+  return textutils.serializeJSON(parts)
+end
+
+local function botName() return gateway.user or "Bot" end
+
 -- ---------- commands ----------
+-- A command gets a ctx and answers with ctx.reply(card), where a card is
+-- { title, description, color, fields = { {name, value} }, footer, content }.
+-- From Discord it becomes an embed; from Minecraft, a chat message to the
+-- player who asked.
 
 local stats = { commands = 0, lastCommand = nil }
-local gateway = { state = "starting", user = nil, ping = nil }
 local whoCache = nil
 
-local COMMANDS = {}
-local ORDER = { "help", "whoonline", "say", "time", "status", "ping" }
+local function discordCtx(msg)
+  return {
+    from = "discord",
+    who = msg.author and (msg.author.global_name or msg.author.username) or "someone",
+    reply = function(card)
+      local embed = nil
+      if card.title or card.description or card.fields then
+        embed = { title = card.title, description = card.description, color = card.color,
+          fields = card.fields and #card.fields > 0 and card.fields or nil,
+          footer = card.footer and { text = card.footer } or nil }
+      end
+      return post("/channels/" .. msg.channel_id .. "/messages", {
+        content = card.content, embeds = embed and { embed } or nil,
+        message_reference = { message_id = msg.id, fail_if_not_exists = false },
+        allowed_mentions = NO_PINGS,
+      })
+    end,
+    -- Everyone in the channel (for !say).
+    announce = function(card)
+      return post("/channels/" .. msg.channel_id .. "/messages", {
+        embeds = { { title = card.title, description = card.description, color = card.color,
+          footer = card.footer and { text = card.footer } or nil } },
+        allowed_mentions = NO_PINGS,
+      })
+    end,
+    cleanup = function()
+      -- Tidy up the command message (needs Manage Messages; fine if it can't).
+      pcall(http.request, { url = API .. "/channels/" .. msg.channel_id .. "/messages/" .. msg.id,
+        method = "DELETE", headers = headers(false) })
+    end,
+  }
+end
 
-COMMANDS.help = { usage = "help", desc = "this list", run = function(msg)
+local function minecraftCtx(player)
+  return {
+    from = "minecraft",
+    who = player,
+    reply = function(card)
+      return chatSend("sendFormattedMessageToPlayer", mcText(card), player, botName(), "[]", "&9")
+    end,
+    announce = function(card)
+      return chatSend("sendFormattedMessage", mcText(card), botName(), "[]", "&9")
+    end,
+    cleanup = function() end,
+  }
+end
+
+local COMMANDS = {}
+local ORDER = { "help", "whoonline", "say", "mc", "time", "status", "ping" }
+
+COMMANDS.help = { usage = "help", desc = "this list", run = function(ctx)
   local lines = {}
   for _, name in ipairs(ORDER) do
     local c = COMMANDS[name]
-    lines[#lines + 1] = "`" .. PREFIX .. c.usage .. "` - " .. c.desc
+    if not (c.discordOnly and ctx.from ~= "discord") then
+      lines[#lines + 1] = "`" .. PREFIX .. c.usage .. "` - " .. c.desc
+    end
   end
-  reply(msg, nil, { title = "Commands", description = table.concat(lines, "\n"), color = COLORS.blurple,
-    footer = { text = "Running on ComputerCraft computer #" .. os.getComputerID() } })
+  if ctx.from == "minecraft" then lines[#lines + 1] = "Start with $ instead of " .. PREFIX .. " to keep it out of chat." end
+  ctx.reply({ title = "Commands", description = table.concat(lines, "\n"), color = COLORS.blurple,
+    footer = "Running on ComputerCraft computer #" .. os.getComputerID() })
 end }
 
-COMMANDS.ping = { usage = "ping", desc = "is the bot alive?", run = function(msg)
-  reply(msg, "{pong} Pong!" .. (gateway.ping and string.format(" Heartbeat %d ms.", gateway.ping) or "")
-    .. " Computer #" .. os.getComputerID() .. ".")
+COMMANDS.ping = { usage = "ping", desc = "is the bot alive?", run = function(ctx)
+  ctx.reply({ content = "{pong} Pong!" .. (gateway.ping and string.format(" Heartbeat %d ms.", gateway.ping) or "")
+    .. " Computer #" .. os.getComputerID() .. "." })
 end }
 
-COMMANDS.time = { usage = "time", desc = "in-game day and time", run = function(msg)
-  reply(msg, nil, { title = "{clock} Day " .. os.day("ingame") .. ", " .. textutils.formatTime(os.time("ingame"), false),
+COMMANDS.time = { usage = "time", desc = "in-game day and time", run = function(ctx)
+  ctx.reply({ title = "{clock} Day " .. os.day("ingame") .. ", " .. textutils.formatTime(os.time("ingame"), false),
     color = COLORS.yellow })
 end }
 
-COMMANDS.whoonline = { usage = "whoonline", desc = "who's on the Minecraft server", run = function(msg)
-  if not cfg.server then
-    reply(msg, "No Minecraft server address set. Run `bot setup` on the computer.")
-    return
+-- Online players: the Player Detector if there is one, else the public
+-- server-status site. Returns names, count, max (max may be nil) or nil, why.
+local function onlinePlayers()
+  if detector then
+    local ok, list = pcall(detector.getOnlinePlayers)
+    if ok and type(list) == "table" then
+      local names = {}
+      for _, n in ipairs(list) do names[#names + 1] = tostring(n) end
+      return names, #names, nil, "player detector"
+    end
+    log("player detector failed: %s", tostring(list))
   end
+  if not cfg.server then return nil, "No Player Detector and no server address (run `startup setup`)." end
   local data = whoCache and now() - whoCache.at < WHOONLINE_CACHE and whoCache.data
   if not data then
     local res, err = http.get("https://api.mcsrvstat.us/3/" .. textutils.urlEncode(cfg.server))
-    if not res then
-      reply(msg, "Couldn't reach the server-status site: " .. tostring(err))
-      return
-    end
+    if not res then return nil, "Couldn't reach the server-status site: " .. tostring(err) end
     data = textutils.unserializeJSON(res.readAll() or "")
     res.close()
-    if type(data) ~= "table" then reply(msg, "The server-status site sent something odd.") return end
+    if type(data) ~= "table" then return nil, "The server-status site sent something odd." end
     whoCache = { at = now(), data = data }
   end
-  if not data.online then
-    reply(msg, nil, { title = "{red} " .. cfg.server .. " is offline", color = COLORS.red })
-    return
-  end
+  if not data.online then return nil, (cfg.server .. " is offline"), true end
   local p = data.players or {}
   local names = {}
   for _, pl in ipairs(p.list or {}) do names[#names + 1] = pl.name end
+  return names, p.online or #names, p.max, cfg.server .. " - updates about once a minute"
+end
+
+COMMANDS.whoonline = { usage = "whoonline", desc = "who's on the Minecraft server", run = function(ctx)
+  local names, count, max, source = onlinePlayers()
+  if not names then
+    ctx.reply(max and { title = "{red} " .. count, color = COLORS.red } or { content = count })
+    return
+  end
   table.sort(names, function(a, b) return a:lower() < b:lower() end)
   local desc
   if #names > 0 then desc = table.concat(names, "\n")
-  elseif (p.online or 0) > 0 then desc = "*(the server doesn't share player names)*"
+  elseif count > 0 then desc = "*(the server doesn't share player names)*"
   else desc = "Nobody right now." end
-  reply(msg, nil, {
-    title = string.format("{green} %d / %d online", p.online or 0, p.max or 0),
-    description = desc:sub(1, 4000),
-    color = COLORS.green,
-    footer = { text = cfg.server .. "  -  updates about once a minute" },
+  ctx.reply({
+    title = max and string.format("{green} %d / %d online", count, max) or string.format("{green} %d online", count),
+    description = desc:sub(1, 4000), color = COLORS.green, footer = source,
   })
 end }
 
-COMMANDS.say = { usage = "say [Title |] text", desc = "post a formatted message", run = function(msg, rest)
-  if rest == "" then reply(msg, "Usage: `" .. PREFIX .. "say Title | your message`") return end
+COMMANDS.say = { usage = "say [Title |] text", desc = "post a formatted message", run = function(ctx, rest)
+  if rest == "" then ctx.reply({ content = "Usage: " .. PREFIX .. "say Title | your message" }) return end
   local title, text = rest:match("^(.-)%s*|%s*(.+)$")
   if not title then title, text = nil, rest end
-  local who = msg.author and (msg.author.global_name or msg.author.username) or "someone"
-  post("/channels/" .. msg.channel_id .. "/messages", {
-    embeds = { { title = title and title:sub(1, 256) or nil, description = text:sub(1, 4000), color = COLORS.blurple,
-      footer = { text = "from " .. tostring(who):sub(1, 64) } } },
-    allowed_mentions = NO_PINGS,
-  })
-  -- Tidy up the command message (needs Manage Messages; fine if it can't).
-  local ok = pcall(http.request, { url = API .. "/channels/" .. msg.channel_id .. "/messages/" .. msg.id,
-    method = "DELETE", headers = headers(false) })
-  if not ok then log("couldn't delete the !say message") end
+  ctx.announce({ title = title and title:sub(1, 256) or nil, description = text:sub(1, 4000), color = COLORS.blurple,
+    footer = "from " .. tostring(ctx.who):sub(1, 64) })
+  ctx.cleanup()
 end }
 
-COMMANDS.status = { usage = "status [name]", desc = "what your computers report", run = function(msg, rest)
+COMMANDS.mc = { usage = "mc text", desc = "send a message into Minecraft chat", discordOnly = true, run = function(ctx, rest)
+  if ctx.from ~= "discord" then return end
+  if not chatBox then ctx.reply({ content = "No Chat Box on the bot's computer." }) return end
+  if rest == "" then ctx.reply({ content = "Usage: " .. PREFIX .. "mc your message" }) return end
+  local json = textutils.serializeJSON({
+    { text = plain(ctx.who):sub(1, 32) .. ": ", color = "#5865F2", bold = true },
+    { text = plain(rest):sub(1, 256), color = "white", bold = false },
+  })
+  if chatSend("sendFormattedMessage", json, "Discord", "[]", "&9") then
+    ctx.reply({ content = "Sent to Minecraft chat." })
+  else
+    ctx.reply({ content = "The Chat Box didn't take it - try again in a second." })
+  end
+end }
+
+COMMANDS.status = { usage = "status [name]", desc = "what your computers report", run = function(ctx, rest)
   local names = {}
   for name in pairs(reports) do
     if rest == "" or name:lower() == rest:lower() then names[#names + 1] = name end
   end
   table.sort(names)
   if #names == 0 then
-    reply(msg, rest == "" and "No computer has reported in yet." or ("Nothing from `" .. rest .. "`."))
+    ctx.reply({ content = rest == "" and "No computer has reported in yet." or ("Nothing from " .. rest .. ".") })
     return
   end
-  local embeds = {}
   for i, name in ipairs(names) do
-    if i > 10 then break end
+    if i > 5 then break end
     local r = reports[name]
-    embeds[#embeds + 1] = { title = "{ship} " .. name, description = r.text, fields = #r.fields > 0 and r.fields or nil,
+    ctx.reply({ title = "{ship} " .. name, description = r.text, fields = r.fields,
       color = now() - r.at < 60 and COLORS.green or COLORS.grey,
-      footer = { text = "computer #" .. r.from .. "  -  " .. ago(r.at) } }
+      footer = "computer #" .. r.from .. "  -  " .. ago(r.at) })
   end
-  post("/channels/" .. msg.channel_id .. "/messages", { embeds = embeds,
-    message_reference = { message_id = msg.id, fail_if_not_exists = false }, allowed_mentions = NO_PINGS })
 end }
 
 -- Commands queue up here so the gateway keeps reading while one runs.
+-- Each item: { ctx = , text = } with the prefix already taken off.
 local queue = {}
+local function runCommand(item)
+  local name, rest = item.text:match("^(%S+)%s*(.-)%s*$")
+  local c = name and COMMANDS[name:lower()]
+  if not c then return end
+  stats.commands = stats.commands + 1
+  stats.lastCommand = PREFIX .. name:lower()
+  log("%s%s from %s (%s)", PREFIX, name:lower(), tostring(item.ctx.who), item.ctx.from)
+  local ok, err = pcall(c.run, item.ctx, rest or "")
+  if not ok then
+    log("%s failed: %s", name, tostring(err))
+    pcall(item.ctx.reply, { content = "Something went wrong running that." })
+  end
+end
+
 local function workLoop()
   while true do
-    while #queue > 0 do
-      local msg = table.remove(queue, 1)
-      local name, rest = msg.content:sub(#PREFIX + 1):match("^(%S+)%s*(.-)%s*$")
-      local c = name and COMMANDS[name:lower()]
-      if c then
-        stats.commands = stats.commands + 1
-        stats.lastCommand = PREFIX .. name:lower()
-        log("%s%s from %s", PREFIX, name:lower(), msg.author and msg.author.username or "?")
-        local ok, err = pcall(c.run, msg, rest or "")
-        if not ok then
-          log("!%s failed: %s", name, tostring(err))
-          pcall(reply, msg, "Something went wrong running that.")
-        end
+    while #queue > 0 do runCommand(table.remove(queue, 1)) end
+    os.pullEvent("bot_command")
+  end
+end
+
+local function queueDiscord(m)
+  queue[#queue + 1] = { ctx = discordCtx(m), text = m.content:sub(#PREFIX + 1) }
+  os.queueEvent("bot_command")
+end
+
+-- Minecraft chat: "!cmd" (seen by everyone) or "$cmd" (the Chat Box hides
+-- those from chat).
+local function chatLoop()
+  while true do
+    local _, player, message = os.pullEvent("chat")
+    if type(player) == "string" and type(message) == "string" then
+      local text = nil
+      if message:sub(1, #PREFIX) == PREFIX then text = message:sub(#PREFIX + 1)
+      elseif message:sub(1, 1) == "$" then text = message:sub(2) end
+      if text and chatBox then
+        queue[#queue + 1] = { ctx = minecraftCtx(player), text = text }
+        os.queueEvent("bot_command")
       end
     end
-    os.pullEvent("bot_command")
   end
 end
 
@@ -377,8 +522,7 @@ local function receiveLoop()
             local m = p.d
             if type(m.content) == "string" and m.content:sub(1, #PREFIX) == PREFIX
                 and not (m.author and m.author.bot) then
-              queue[#queue + 1] = m
-              os.queueEvent("bot_command")
+              queueDiscord(m)
             end
           end
         elseif p.op == 1 then
@@ -477,6 +621,7 @@ local function draw()
   local n = 0
   for _ in pairs(reports) do n = n + 1 end
   print(" Reports  " .. n .. " computer" .. (n == 1 and "" or "s"))
+  print(" Chat Box " .. (chatBox and "yes" or "no") .. "   Player Detector " .. (detector and "yes" or "no"))
   if fatal then
     print("")
     if term.isColor() then term.setTextColor(colors.red) end
@@ -523,7 +668,7 @@ else log("no wireless modem: !status only works with one") end
 
 local ok, err = xpcall(function()
   parallel.waitForAny(function() gatewayLoop() while true do os.pullEvent("never") end end,
-    workLoop, netLoop, screenLoop)
+    workLoop, netLoop, screenLoop, chatLoop)
 end, debug.traceback)
 log("stopped: %s", ok and "ok" or tostring(err))
 if ws then pcall(ws.close) end
