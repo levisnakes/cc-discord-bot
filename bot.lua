@@ -1,0 +1,538 @@
+-- CC Discord Bot: runs your Discord bot from a ComputerCraft computer.
+--
+-- The computer logs in to Discord as the bot (over a websocket), reads
+-- commands typed in your server and answers them:
+--   !help        what it can do
+--   !whoonline   who's on the Minecraft server (through api.mcsrvstat.us)
+--   !say text    posts the text as a formatted embed ("!say Title | text"
+--                gives it a title)
+--   !time        the in-game day and time
+--   !ping        checks the bot is alive
+--   !status      reports other computers send in over a modem (see README)
+--
+-- First run asks for the bot token and the Minecraft server address and
+-- saves them in bot.cfg. The token is a password: anyone who can read this
+-- computer's files can use your bot.
+--
+-- Everything is written to bot.log (the run before is bot.log.old).
+
+VERSION = "1.0.0"
+
+-- ======================== SETTINGS ===========================
+-- To keep changes over updates, put them in bot_settings.lua instead.
+
+PREFIX = "!"                 -- what commands start with
+STATUS_PROTOCOL = "ccdiscord" -- rednet protocol other computers report on
+WHOONLINE_CACHE = 30         -- seconds to reuse a !whoonline answer
+
+-- ===================== END OF SETTINGS =======================
+
+if fs.exists("bot_settings.lua") then
+  local f, err = loadfile("bot_settings.lua", nil, _ENV)
+  if not f then error("bot_settings.lua: " .. err, 0) end
+  f()
+end
+
+local CONFIG_FILE = "bot.cfg"
+local API = "https://discord.com/api/v10"
+local GATEWAY = "wss://gateway.discord.gg/?v=10&encoding=json"
+-- Guild messages (512), direct messages (4096), message content (32768).
+local INTENTS = 512 + 4096 + 32768
+local COLORS = { blurple = 5793266, green = 5763719, red = 15548997, yellow = 16705372, grey = 9807270 }
+-- Emoji go in as JSON escapes after serializing (CC strings are bytes).
+local EMOJI = { ["{green}"] = "\\ud83d\\udfe2", ["{red}"] = "\\ud83d\\udd34", ["{clock}"] = "\\ud83d\\udd52",
+  ["{ship}"] = "\\ud83d\\udea2", ["{pong}"] = "\\ud83c\\udfd3" }
+
+local function now() return os.epoch("utc") / 1000 end
+
+-- ---------- log ----------
+local LOG_FILE, LOG_LIMIT = "bot.log", 100000
+local logFile, logBytes, logFull = nil, 0, false
+local logLines = {}           -- the last few, for the screen
+local function log(fmt, ...)
+  local line = string.format(fmt, ...)
+  logLines[#logLines + 1] = textutils.formatTime(os.time(), true) .. " " .. line
+  if #logLines > 8 then table.remove(logLines, 1) end
+  os.queueEvent("bot_redraw")
+  if not logFile or logFull then return end
+  local full = os.date("%H:%M:%S ") .. line
+  logBytes = logBytes + #full + 1
+  if logBytes > LOG_LIMIT then
+    logFull = true
+    full = "log full, stopped writing"
+  end
+  logFile.writeLine(full)
+  logFile.flush()
+end
+
+-- ---------- setup ----------
+
+local cfg = {}
+local function saveConfig()
+  local h = fs.open(CONFIG_FILE, "w")
+  h.write(textutils.serialize(cfg))
+  h.close()
+end
+local function loadConfig()
+  if fs.exists(CONFIG_FILE) then
+    local h = fs.open(CONFIG_FILE, "r")
+    local saved = textutils.unserialize(h.readAll() or "")
+    h.close()
+    if type(saved) == "table" then cfg = saved end
+  end
+end
+
+local function setup()
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("CC Discord Bot setup")
+  print("")
+  print("1. discord.com/developers -> your app -> Bot.")
+  print("2. Turn ON 'Message Content Intent'.")
+  print("3. Reset/copy the token and paste it here")
+  print("   (Ctrl+V). It isn't shown.")
+  print("")
+  local token
+  repeat
+    write("Bot token: ")
+    token = (read("*") or ""):gsub("%s", ""):gsub("^Bot", "")
+  until #token > 20
+  print("")
+  print("Minecraft server address for !whoonline")
+  print("(like play.example.com, blank to skip):")
+  write("> ")
+  local addr = (read() or ""):gsub("%s", "")
+  cfg.token = token
+  cfg.server = addr ~= "" and addr or nil
+  saveConfig()
+  print("")
+  print("Saved in bot.cfg. To change it later: bot setup")
+  sleep(1.5)
+end
+
+-- ---------- Discord REST ----------
+
+local function headers(json)
+  local h = {
+    Authorization = "Bot " .. cfg.token,
+    ["User-Agent"] = "DiscordBot (https://github.com/levisnakes/cc-discord-bot, " .. VERSION .. ")",
+  }
+  if json then h["Content-Type"] = "application/json" end
+  return h
+end
+
+local function toJSON(payload)
+  local s = textutils.serializeJSON(payload)
+  for k, v in pairs(EMOJI) do
+    local pat = k:gsub("%p", "%%%0")
+    s = s:gsub(pat, v)
+  end
+  return s
+end
+
+-- POST with one retry on a rate limit. Returns true when it went through.
+local function post(path, payload)
+  local body = toJSON(payload)
+  for _ = 1, 3 do
+    local res, err, bad = http.post(API .. path, body, headers(true))
+    if res then res.close() return true end
+    local code = bad and bad.getResponseCode()
+    local text = bad and bad.readAll() or ""
+    if bad then bad.close() end
+    if code == 429 then
+      local j = textutils.unserializeJSON(text)
+      local wait = (j and tonumber(j.retry_after)) or 1
+      log("rate limited, waiting %.1f s", wait)
+      sleep(wait + 0.1)
+    else
+      log("POST %s failed: %s %s", path, tostring(code or err), text:sub(1, 150))
+      return false
+    end
+  end
+  return false
+end
+
+local NO_PINGS = { parse = textutils.empty_json_array or {} }
+
+-- Reply to a message with plain text and/or an embed.
+local function reply(msg, content, embed)
+  return post("/channels/" .. msg.channel_id .. "/messages", {
+    content = content,
+    embeds = embed and { embed } or nil,
+    message_reference = { message_id = msg.id, fail_if_not_exists = false },
+    allowed_mentions = NO_PINGS,
+  })
+end
+
+-- ---------- what other computers report ----------
+
+local reports = {}   -- name -> { text = , fields = , at = , from = }
+
+local function netLoop()
+  while true do
+    local _, from, msg, proto = os.pullEvent("rednet_message")
+    if proto == STATUS_PROTOCOL and type(msg) == "table" and type(msg.name) == "string" then
+      local fields = {}
+      if type(msg.fields) == "table" then
+        for k, v in pairs(msg.fields) do
+          if #fields < 20 then fields[#fields + 1] = { name = tostring(k):sub(1, 256), value = tostring(v):sub(1, 1024), inline = true } end
+        end
+        table.sort(fields, function(a, b) return a.name < b.name end)
+      end
+      reports[msg.name:sub(1, 64)] = { text = msg.text and tostring(msg.text):sub(1, 2000) or nil, fields = fields,
+        at = now(), from = from }
+    end
+  end
+end
+
+local function ago(t)
+  local s = math.floor(now() - t)
+  if s < 60 then return s .. "s ago" end
+  if s < 3600 then return math.floor(s / 60) .. "m ago" end
+  return math.floor(s / 3600) .. "h ago"
+end
+
+-- ---------- commands ----------
+
+local stats = { commands = 0, lastCommand = nil }
+local gateway = { state = "starting", user = nil, ping = nil }
+local whoCache = nil
+
+local COMMANDS = {}
+local ORDER = { "help", "whoonline", "say", "time", "status", "ping" }
+
+COMMANDS.help = { usage = "help", desc = "this list", run = function(msg)
+  local lines = {}
+  for _, name in ipairs(ORDER) do
+    local c = COMMANDS[name]
+    lines[#lines + 1] = "`" .. PREFIX .. c.usage .. "` - " .. c.desc
+  end
+  reply(msg, nil, { title = "Commands", description = table.concat(lines, "\n"), color = COLORS.blurple,
+    footer = { text = "Running on ComputerCraft computer #" .. os.getComputerID() } })
+end }
+
+COMMANDS.ping = { usage = "ping", desc = "is the bot alive?", run = function(msg)
+  reply(msg, "{pong} Pong!" .. (gateway.ping and string.format(" Heartbeat %d ms.", gateway.ping) or "")
+    .. " Computer #" .. os.getComputerID() .. ".")
+end }
+
+COMMANDS.time = { usage = "time", desc = "in-game day and time", run = function(msg)
+  reply(msg, nil, { title = "{clock} Day " .. os.day("ingame") .. ", " .. textutils.formatTime(os.time("ingame"), false),
+    color = COLORS.yellow })
+end }
+
+COMMANDS.whoonline = { usage = "whoonline", desc = "who's on the Minecraft server", run = function(msg)
+  if not cfg.server then
+    reply(msg, "No Minecraft server address set. Run `bot setup` on the computer.")
+    return
+  end
+  local data = whoCache and now() - whoCache.at < WHOONLINE_CACHE and whoCache.data
+  if not data then
+    local res, err = http.get("https://api.mcsrvstat.us/3/" .. textutils.urlEncode(cfg.server))
+    if not res then
+      reply(msg, "Couldn't reach the server-status site: " .. tostring(err))
+      return
+    end
+    data = textutils.unserializeJSON(res.readAll() or "")
+    res.close()
+    if type(data) ~= "table" then reply(msg, "The server-status site sent something odd.") return end
+    whoCache = { at = now(), data = data }
+  end
+  if not data.online then
+    reply(msg, nil, { title = "{red} " .. cfg.server .. " is offline", color = COLORS.red })
+    return
+  end
+  local p = data.players or {}
+  local names = {}
+  for _, pl in ipairs(p.list or {}) do names[#names + 1] = pl.name end
+  table.sort(names, function(a, b) return a:lower() < b:lower() end)
+  local desc
+  if #names > 0 then desc = table.concat(names, "\n")
+  elseif (p.online or 0) > 0 then desc = "*(the server doesn't share player names)*"
+  else desc = "Nobody right now." end
+  reply(msg, nil, {
+    title = string.format("{green} %d / %d online", p.online or 0, p.max or 0),
+    description = desc:sub(1, 4000),
+    color = COLORS.green,
+    footer = { text = cfg.server .. "  -  updates about once a minute" },
+  })
+end }
+
+COMMANDS.say = { usage = "say [Title |] text", desc = "post a formatted message", run = function(msg, rest)
+  if rest == "" then reply(msg, "Usage: `" .. PREFIX .. "say Title | your message`") return end
+  local title, text = rest:match("^(.-)%s*|%s*(.+)$")
+  if not title then title, text = nil, rest end
+  local who = msg.author and (msg.author.global_name or msg.author.username) or "someone"
+  post("/channels/" .. msg.channel_id .. "/messages", {
+    embeds = { { title = title and title:sub(1, 256) or nil, description = text:sub(1, 4000), color = COLORS.blurple,
+      footer = { text = "from " .. tostring(who):sub(1, 64) } } },
+    allowed_mentions = NO_PINGS,
+  })
+  -- Tidy up the command message (needs Manage Messages; fine if it can't).
+  local ok = pcall(http.request, { url = API .. "/channels/" .. msg.channel_id .. "/messages/" .. msg.id,
+    method = "DELETE", headers = headers(false) })
+  if not ok then log("couldn't delete the !say message") end
+end }
+
+COMMANDS.status = { usage = "status [name]", desc = "what your computers report", run = function(msg, rest)
+  local names = {}
+  for name in pairs(reports) do
+    if rest == "" or name:lower() == rest:lower() then names[#names + 1] = name end
+  end
+  table.sort(names)
+  if #names == 0 then
+    reply(msg, rest == "" and "No computer has reported in yet." or ("Nothing from `" .. rest .. "`."))
+    return
+  end
+  local embeds = {}
+  for i, name in ipairs(names) do
+    if i > 10 then break end
+    local r = reports[name]
+    embeds[#embeds + 1] = { title = "{ship} " .. name, description = r.text, fields = #r.fields > 0 and r.fields or nil,
+      color = now() - r.at < 60 and COLORS.green or COLORS.grey,
+      footer = { text = "computer #" .. r.from .. "  -  " .. ago(r.at) } }
+  end
+  post("/channels/" .. msg.channel_id .. "/messages", { embeds = embeds,
+    message_reference = { message_id = msg.id, fail_if_not_exists = false }, allowed_mentions = NO_PINGS })
+end }
+
+-- Commands queue up here so the gateway keeps reading while one runs.
+local queue = {}
+local function workLoop()
+  while true do
+    while #queue > 0 do
+      local msg = table.remove(queue, 1)
+      local name, rest = msg.content:sub(#PREFIX + 1):match("^(%S+)%s*(.-)%s*$")
+      local c = name and COMMANDS[name:lower()]
+      if c then
+        stats.commands = stats.commands + 1
+        stats.lastCommand = PREFIX .. name:lower()
+        log("%s%s from %s", PREFIX, name:lower(), msg.author and msg.author.username or "?")
+        local ok, err = pcall(c.run, msg, rest or "")
+        if not ok then
+          log("!%s failed: %s", name, tostring(err))
+          pcall(reply, msg, "Something went wrong running that.")
+        end
+      end
+    end
+    os.pullEvent("bot_command")
+  end
+end
+
+-- ---------- gateway ----------
+
+local ws = nil
+local seq = nil
+local acked = true
+local beatSent = nil
+local fatal = nil     -- a reason to stop reconnecting
+
+local FATAL = {
+  [4004] = "Discord rejected the token. Run 'bot setup' and paste the current one.",
+  [4013] = "Invalid intents.",
+  [4014] = "Turn ON 'Message Content Intent' (Developer Portal -> Bot), then reboot.",
+}
+
+local function sendRaw(s)
+  if ws then pcall(ws.send, s) end
+end
+
+local function heartbeat()
+  acked = false
+  beatSent = now()
+  sendRaw('{"op":1,"d":' .. (seq and string.format("%d", seq) or "null") .. '}')
+end
+
+local function heartbeatLoop(interval)
+  sleep(interval * math.random())
+  while true do
+    if not acked then
+      log("no heartbeat reply - reconnecting")
+      return
+    end
+    heartbeat()
+    sleep(interval)
+  end
+end
+
+local function receiveLoop()
+  while true do
+    local ev, url, a, b = os.pullEvent()
+    if ev == "websocket_closed" and url == GATEWAY then
+      log("disconnected: %s %s", tostring(b or ""), tostring(a or ""))
+      if b and FATAL[b] then fatal = FATAL[b] end
+      return
+    elseif ev == "websocket_message" and url == GATEWAY then
+      local p = textutils.unserializeJSON(a)
+      if type(p) == "table" then
+        if p.s then seq = p.s end
+        if p.op == 0 then
+          if p.t == "READY" then
+            gateway.user = p.d.user and p.d.user.username
+            gateway.state = "online"
+            log("online as %s", tostring(gateway.user))
+          elseif p.t == "MESSAGE_CREATE" then
+            local m = p.d
+            if type(m.content) == "string" and m.content:sub(1, #PREFIX) == PREFIX
+                and not (m.author and m.author.bot) then
+              queue[#queue + 1] = m
+              os.queueEvent("bot_command")
+            end
+          end
+        elseif p.op == 1 then
+          heartbeat()
+        elseif p.op == 11 then
+          acked = true
+          if beatSent then gateway.ping = math.floor((now() - beatSent) * 1000 + 0.5) end
+        elseif p.op == 7 then
+          log("Discord asked for a reconnect")
+          return
+        elseif p.op == 9 then
+          log("session invalid - logging in again")
+          sleep(2)
+          return
+        end
+      end
+    end
+  end
+end
+
+local function connectOnce()
+  gateway.state = "connecting"
+  os.queueEvent("bot_redraw")
+  local w, err = http.websocket(GATEWAY)
+  if not w then
+    log("can't connect: %s", tostring(err))
+    return
+  end
+  ws, seq, acked = w, nil, true
+  -- Hello first: it says how often to heartbeat.
+  local interval = nil
+  local timer = os.startTimer(15)
+  while not interval do
+    local ev, url, a = os.pullEvent()
+    if ev == "websocket_message" and url == GATEWAY then
+      local p = textutils.unserializeJSON(a)
+      if type(p) == "table" and p.op == 10 then interval = p.d.heartbeat_interval / 1000 end
+    elseif ev == "timer" and url == timer then
+      log("no hello from Discord")
+      pcall(w.close)
+      ws = nil
+      return
+    elseif ev == "websocket_closed" and url == GATEWAY then
+      ws = nil
+      return
+    end
+  end
+  os.cancelTimer(timer)
+  sendRaw(textutils.serializeJSON({ op = 2, d = {
+    token = cfg.token, intents = INTENTS,
+    properties = { os = "computercraft", browser = "cc-discord-bot", device = "cc-discord-bot" },
+  } }))
+  gateway.state = "logging in"
+  parallel.waitForAny(function() heartbeatLoop(interval) end, receiveLoop)
+  pcall(w.close)
+  ws = nil
+end
+
+local function gatewayLoop()
+  local wait = 2
+  while true do
+    local started = now()
+    connectOnce()
+    gateway.state = "offline"
+    if fatal then
+      log(fatal)
+      return
+    end
+    -- Back off if it keeps dropping straight away.
+    if now() - started > 60 then wait = 2 else wait = math.min(wait * 2, 60) end
+    log("reconnecting in %d s", wait)
+    sleep(wait)
+  end
+end
+
+-- ---------- screen ----------
+
+local function draw()
+  local W = term.getSize()
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  term.setCursorPos(1, 1)
+  local col = gateway.state == "online" and colors.green or (fatal and colors.red or colors.orange)
+  if term.isColor() then term.setBackgroundColor(colors.blue) end
+  local title = " CC Discord Bot v" .. VERSION
+  local badge = " " .. (fatal and "STOPPED" or gateway.state:upper()) .. " "
+  term.write(title .. string.rep(" ", math.max(1, W - #title - #badge)))
+  if term.isColor() then term.setBackgroundColor(col) end
+  term.write(badge)
+  term.setBackgroundColor(colors.black)
+  term.setCursorPos(1, 3)
+  print(" Bot      " .. (gateway.user or "-"))
+  print(" Server   " .. (cfg.server or "(none - !whoonline off)"))
+  print(" Commands " .. stats.commands .. (stats.lastCommand and ("  last: " .. stats.lastCommand) or ""))
+  print(" Ping     " .. (gateway.ping and (gateway.ping .. " ms") or "-"))
+  local n = 0
+  for _ in pairs(reports) do n = n + 1 end
+  print(" Reports  " .. n .. " computer" .. (n == 1 and "" or "s"))
+  if fatal then
+    print("")
+    if term.isColor() then term.setTextColor(colors.red) end
+    print(fatal)
+    term.setTextColor(colors.white)
+  end
+  print("")
+  if term.isColor() then term.setTextColor(colors.lightGray) end
+  for _, l in ipairs(logLines) do print(" " .. l:sub(1, W - 2)) end
+  term.setTextColor(colors.white)
+end
+
+local function screenLoop()
+  local timer = os.startTimer(0)
+  while true do
+    local ev, a = os.pullEvent()
+    if ev == "bot_redraw" or (ev == "timer" and a == timer) then
+      draw()
+      if ev == "timer" then timer = os.startTimer(5) end
+    end
+  end
+end
+
+-- ---------- start ----------
+
+local args = { ... }
+loadConfig()
+if args[1] == "setup" or not cfg.token then setup() end
+if not http or not http.websocket then
+  printError("This computer can't use http/websockets (server config).")
+  return
+end
+
+if fs.exists(LOG_FILE) then
+  if fs.exists(LOG_FILE .. ".old") then fs.delete(LOG_FILE .. ".old") end
+  fs.move(LOG_FILE, LOG_FILE .. ".old")
+end
+logFile = fs.open(LOG_FILE, "w")
+math.randomseed(os.epoch("utc"))
+log("CC Discord Bot v%s on computer #%d", VERSION, os.getComputerID())
+local modem = peripheral.find("modem", function(_, m) return m.isWireless() end)
+if modem then rednet.open(peripheral.getName(modem)) log("listening for reports on %s", peripheral.getName(modem))
+else log("no wireless modem: !status only works with one") end
+
+local ok, err = xpcall(function()
+  parallel.waitForAny(function() gatewayLoop() while true do os.pullEvent("never") end end,
+    workLoop, netLoop, screenLoop)
+end, debug.traceback)
+log("stopped: %s", ok and "ok" or tostring(err))
+if ws then pcall(ws.close) end
+if logFile then logFile.close() end
+term.setBackgroundColor(colors.black)
+term.setTextColor(colors.white)
+term.clear()
+term.setCursorPos(1, 1)
+if not ok and not tostring(err):find("Terminated") then
+  printError("Stopped: " .. tostring(err):match("^[^\n]*"))
+  print("Details are in bot.log.")
+end
