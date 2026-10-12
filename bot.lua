@@ -20,7 +20,7 @@
 --
 -- Everything is written to bot.log (the run before is bot.log.old).
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 -- ======================== SETTINGS ===========================
 -- To keep changes over updates, put them in bot_settings.lua instead.
@@ -244,8 +244,7 @@ local function mcText(card)
   end
   if card.content then parts[#parts + 1] = { text = plain(card.content), color = "white" } end
   if card.footer and card.footerInGame then
-    parts[#parts + 1] = { text = "
-" .. plain(card.footer), color = "gray", bold = false, italic = true }
+    parts[#parts + 1] = { text = "\n" .. plain(card.footer), color = "gray", bold = false, italic = true }
   end
   if #parts == 0 then parts[1] = { text = "" } end
   return textutils.serializeJSON(parts)
