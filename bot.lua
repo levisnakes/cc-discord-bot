@@ -20,7 +20,7 @@
 --
 -- Everything is written to bot.log (the run before is bot.log.old).
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 
 -- ======================== SETTINGS ===========================
 -- To keep changes over updates, put them in bot_settings.lua instead.
@@ -65,8 +65,8 @@ local function log(fmt, ...)
     logFull = true
     full = "log full, stopped writing"
   end
-  logFile.writeLine(full)
-  logFile.flush()
+  -- A full disk must never stop the program.
+  if not pcall(function() logFile.writeLine(full) logFile.flush() end) then logFile = nil end
 end
 
 -- ---------- setup ----------
